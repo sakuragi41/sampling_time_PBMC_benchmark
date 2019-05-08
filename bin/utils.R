@@ -1,3 +1,6 @@
+# This file contains all the function definition used throughout this project
+# They are sorted in the exact same order they are used in the analysis notebooks
+
 normalize_hash <- function(sce) {
   # Normalizes each hashtag oligonucleotide (HTO) UMI by dividing by the  
   # geometric mean and log-transforming it.
@@ -43,6 +46,8 @@ plot_heatmap <- function(sce, assay = "logcounts", title, order = FALSE, annotat
   #   sce: A SingleCellExperiment object filtered to only contain the expression 
   #        of HTO, and with a "cluster" variable in the colData slot.
   #   assay: the matrix to use for the heatmap (logcounts or classification_mat)
+  #   title: character string with the title for the heatmap 
+  #   legend: logical indicating if the legend should be plotted. 
   #      
   # Returns:
   #   A pheatmap object
@@ -335,6 +340,195 @@ plot_tsne <- function(sce,
   tsne
 }
 
+find_gene_signature <- function(sce, n_genes = 100, random = FALSE) {
+  # Find top 100 differentially expressed genes between two conditions.
+  # 
+  # Args: 
+  #   sce: A SingleCellExperiment object with a "label" binary variable
+  #        which labels cells as "affected" or "unaffected".
+  #   n_genes: numeric indicating how many genes the gene signature should have
+  #   random: logical indicating whether or not to find a random singature.
+  # 
+  # Returns:
+  #   A dataframe with 2 variables: "gene" (vector of the top 100 DEG ranked by
+  #   p-value) and "sign" (-1 if downregulated, +1 if upregulated). If random = TRUE,
+  #   100 extra rows are added with random gene symbols from rownames(sce), and a 
+  #   3rd variable "is_random" is added.
+  seurat <- Convert(from = sce, to = "seurat")
+  seurat <- SetAllIdent(object = seurat, id = "label")
+  seurat <- ScaleData(seurat)
+  dea_output <- FindMarkers(
+    seurat, 
+    ident.1 = "affected", 
+    ident.2 = "unaffected", 
+    test.use = "MAST",
+    logfc.threshold = 0
+  )
+  output_df <- data.frame(
+    gene = rownames(dea_output)[1:n_genes],
+    sign = sign(dea_output$avg_logFC[1:n_genes]),
+    p_val_adj = dea_output$p_val_adj[1:n_genes],
+    log_fc = dea_output$avg_logFC[1:n_genes]
+  )
+  if (random == TRUE) {
+    random_signature <- sample(rownames(sce), size = n_genes, replace = FALSE)
+    sign_rand <- sign(dea_output[random_signature, "avg_logFC"])
+    sign_rand[is.na(sign_rand)] <- 0 
+    log_fc_rand <- dea_output[random_signature, "avg_logFC"]
+    log_fc_rand[is.na(log_fc_rand)] <- 0
+    p_val_adj_rand <- dea_output[random_signature, "p_val_adj"]
+    p_val_adj_rand[is.na(p_val_adj_rand)] <- 1
+    random_df <- data.frame(
+      gene = random_signature, 
+      sign = sign_rand, 
+      log_fc = log_fc_rand, 
+      p_val_adj = p_val_adj_rand
+    )
+    output_df <- rbind(output_df, random_df)
+    output_df$is_random <- c(rep(FALSE, n_genes), rep(TRUE, n_genes))
+  } 
+  output_df
+}
+
+calc_time_score <- function(sce, signature_df, random = FALSE) {
+  # Calculate time score for every cell in sce.
+  # 
+  # Args: 
+  #   sce: A SingleCellExperiment object.
+  #   signature_df: a dataframe with the variables "gene" (chr vector with the 
+  #                 gene symbols of the signature ordered by importance) and 
+  #                 "sign" (-1 if downregulated, +1 if upregulated). It can 
+  #                 contain a "is_random" to distinguish genes from the random signature.
+  #   random: logical indicating whether or not to calculate random time score.
+  # 
+  # Returns:
+  #   Original sce with a new variable "time_score", which is computed by adding together
+  #   the weighted scaled counts of the genes in the signature. The weights correspond to 
+  #   the inverse ranking in the signature, signed with the direction of the DE. If 
+  #   random = TRUE it adds an extra "time_score_random" variable.
+  
+  row_selection <- rownames(sce) %in% signature_df$gene
+  sce_sub <- sce[row_selection, ]
+  seurat <- Convert(from = sce_sub, to = "seurat")
+  seurat <- ScaleData(seurat)
+  
+  if ("is_random" %in% colnames(signature_df)) {
+    signature_df_sub <- signature_df[!(signature_df$is_random), ]
+  } else {
+    signature_df_sub <- signature_df
+  }
+  
+  signature_df_sub$weight <- rev(1:nrow(signature_df_sub)) * signature_df_sub$sign
+  time_score <- map_dbl(colnames(sce), function(cell) {
+    norm_counts <- seurat@scale.data[as.character(signature_df_sub$gene), cell]
+    sum(norm_counts * signature_df_sub$weight)
+  })
+  sce$time_score <- time_score
+  
+  if (random == TRUE) {
+    signature_df_sub <- signature_df[signature_df$is_random, ]
+    signature_df_sub$weight <- rev(1:nrow(signature_df_sub)) * signature_df_sub$sign
+    time_score_random <- map_dbl(colnames(sce), function(cell) {
+      norm_counts <- seurat@scale.data[as.character(signature_df_sub$gene), cell]
+      sum(norm_counts * signature_df_sub$weight)
+    })
+    sce$time_score_random <- time_score_random
+  }
+  sce
+}
+
+test_time_score <- function(sce, random = FALSE, return_ROC = FALSE) {
+  # Tests the discriminative power of "time_score" with different accuracies.
+  # 
+  # Args: 
+  #   sce: A SingleCellExperiment object with a "label" variable that contains the observed
+  #        classes (affected/unaffected), a time_score and potentially a time_score_random 
+  #        variables.
+  #   random: logical indicating whether the accuracies should be calculated for the real
+  #           time score or for the random one.
+  #   return_ROC: logical indicating whether a data frame containing the TPR and FPR for 
+  #               several time_score cutoffs should be returned or not.
+  # Returns: a data frame with the variables "accuracy_measure" (sensitivity, etc.),
+  #          "value". If return_ROC = TRUE, returns another data frame
+  #          to plot a ROC curve.
+  
+  # Define "prediction" and "performance" objects from the ROCR package
+  if (random) {
+    time_score <- sce$time_score_random
+  } else {
+    time_score <- sce$time_score
+  }
+  labs <- factor(sce$label, c("unaffected", "affected"), ordered = TRUE)
+  pred <- prediction(predictions = time_score, labels = labs)
+  perf <- performance(prediction.obj = pred, measure = "tpr", x.measure = "fpr")
+  
+  # Find index optimal cutoff as the one that maximizes specificity and sensitivity
+  find_opt_cut <- function(perf, pred){
+    cut.ind <- mapply(FUN = function(x, y, p){
+      d <- (x - 0)^2 + (y - 1)^2
+      ind <- which(d == min(d))
+      ind
+    }, perf@x.values, perf@y.values, pred@cutoffs)
+  }
+  ind_opt_cut <- find_opt_cut(perf, pred)
+  
+  # Compute accuracy metrices
+  accuracies <- c("sens", "spec", "acc", "prec")
+  values <- c()
+  for (metric in accuracies) {
+    curr_perf <- performance(pred, metric)
+    value <- curr_perf@y.values[[1]][ind_opt_cut]
+    values <- c(values, value)
+  }
+  accuracies_df <- data.frame(accuracies, values)
+  
+  # Return
+  if (return_ROC == TRUE) {
+    roc_df <- data.frame(fpr = unlist(perf@x.values), tpr = unlist(perf@y.values))
+    list(accuracies = accuracies_df, roc = roc_df)
+  } else {
+    accuracies_df
+  }
+}
+
+find_var_genes <- function(sce) {
+  # Takes a SingleCellExperiment object, finds and filters for HVG. Return SCE
+  fit_var <- trendVar(sce, use.spikes = FALSE) 
+  decomp_var <- decomposeVar(sce, fit_var)
+  top_hvgs <- order(decomp_var$bio, decreasing = TRUE)
+  top_20_pct_hvgs <- top_hvgs[1:(0.2 * length(top_hvgs))]
+  sce <- sce[top_20_pct_hvgs, ]
+  sce
+}
+
+get_GOenrichment <- function(target, universe) {
+  # Performs a Gene Ontology enrichment analysis for a given target gene set and
+  # universe.
+  #
+  # Args:
+  #   target: character vector with the mgi symbols corresponding to the target
+  #           set.
+  #   universe: integer vector with the entrez symbols corresponding to the gene
+  #             universe. 
+  #
+  # Returns:
+  #   A data.frame with the GO id, the p-value, the Odds score and the 
+  #   description of every enriched GO term.
+  
+  params <- new("GOHyperGParams", geneIds = target, 
+                universeGeneIds = universe, annotation = "org.Hs.eg.db",
+                ontology = "BP", pvalueCutoff = 1, 
+                conditional = TRUE, testDirection = "over")
+  hgOver_df <- summary(hyperGTest(params))
+  go_results <- hgOver_df %>% 
+    arrange(desc(OddsRatio))
+  go_results
+}
+
+########################################################################
+###############################DEPRECATED###############################
+########################################################################
+
 calculate_stress_metric3 <- function(sce, stress_df, cell) {
   # Calculates a stress metric for each cell in sce.
   # 
@@ -541,165 +735,6 @@ get_stress_signature_seurat <- function(sce, test_sce) {
   output
 }
 
-get_GOenrichment <- function(target, universe) {
-  # Performs a Gene Ontology enrichment analysis for a given target gene set and
-  # universe.
-  #
-  # Args:
-  #   target: character vector with the mgi symbols corresponding to the target
-  #           set.
-  #   universe: integer vector with the entrez symbols corresponding to the gene
-  #             universe. 
-  #
-  # Returns:
-  #   A data.frame with the GO id, the p-value, the Odds score and the 
-  #   description of every enriched GO term.
-  
-  params <- new("GOHyperGParams", geneIds = target, 
-                universeGeneIds = universe, annotation = "org.Hs.eg.db",
-                ontology = "BP", pvalueCutoff = 1, 
-                conditional = TRUE, testDirection = "over")
-  hgOver_df <- summary(hyperGTest(params))
-  go_results <- hgOver_df %>% 
-    arrange(desc(OddsRatio))
-  go_results
-}
-
-find_gene_signature <- function(sce, n_genes = 100, random = FALSE) {
-  # Find top 100 differentially expressed genes between two conditions.
-  # 
-  # Args: 
-  #   sce: A SingleCellExperiment object with a "label" binary variable
-  #        which labels cells as "affected" or "unaffected".
-  #   random: logical indicating whether or not to find a random singature.
-  # 
-  # Returns:
-  #   A dataframe with 2 variables: "gene" (vector of the top 100 DEG ranked by
-  #   p-value) and "sign" (-1 if downregulated, +1 if upregulated). If random = TRUE,
-  #   100 extra rows are added with random gene symbols from rownames(sce), and a 
-  #   3rd variable "is_random" is added.
-  seurat <- Convert(from = sce, to = "seurat")
-  seurat <- SetAllIdent(object = seurat, id = "label")
-  seurat <- ScaleData(seurat)
-  dea_output <- FindMarkers(
-    seurat, 
-    ident.1 = "affected", 
-    ident.2 = "unaffected", 
-    test.use = "MAST",
-    logfc.threshold = 0
-  )
-  output_df <- data.frame(
-    gene = rownames(dea_output)[1:n_genes],
-    sign = sign(dea_output$avg_logFC[1:n_genes]),
-    p_val_adj = dea_output$p_val_adj[1:n_genes],
-    log_fc = dea_output$avg_logFC[1:n_genes]
-  )
-  if (random == TRUE) {
-    random_signature <- sample(rownames(sce), size = n_genes, replace = FALSE)
-    sign_rand <- sign(dea_output[random_signature, "avg_logFC"])
-    sign_rand[is.na(sign_rand)] <- 0 
-    log_fc_rand <- dea_output[random_signature, "avg_logFC"]
-    log_fc_rand[is.na(log_fc_rand)] <- 0
-    p_val_adj_rand <- dea_output[random_signature, "p_val_adj"]
-    p_val_adj_rand[is.na(p_val_adj_rand)] <- 1
-    random_df <- data.frame(
-      gene = random_signature, 
-      sign = sign_rand, 
-      log_fc = log_fc_rand, 
-      p_val_adj = p_val_adj_rand
-    )
-    output_df <- rbind(output_df, random_df)
-    output_df$is_random <- c(rep(FALSE, n_genes), rep(TRUE, n_genes))
-  } 
-  output_df
-}
-
-find_gene_signature2 <- function(sce, random = FALSE) {
-  # Find top 100 differentially expressed genes between two conditions.
-  # 
-  # Args: 
-  #   sce: A SingleCellExperiment object with a "label" binary variable
-  #        which labels cells as "affected" or "unaffected".
-  #   vars_to_regress: chr vector with the variables to regress out.
-  #   random: logical indicating whether or not to find a random singature.
-  # 
-  # Returns:
-  #   A dataframe with 2 variables: "gene" (vector of the top 100 DEG ranked by
-  #   p-value) and "sign" (-1 if downregulated, +1 if upregulated). If random = TRUE,
-  #   100 extra rows are added with random gene symbols from rownames(sce), and a 
-  #   3rd variable "is_random" is added.
-  seurat <- Convert(from = sce, to = "seurat")
-  seurat <- SetAllIdent(object = seurat, id = "label")
-  seurat <- ScaleData(seurat)
-  dea_output <- FindMarkers(
-    seurat, 
-    ident.1 = "affected", 
-    ident.2 = "unaffected", 
-    test.use = "MAST",
-    logfc.threshold = 0
-  )
-  output_df <- data.frame(
-    gene = rownames(dea_output)[1:100],
-    log_fc = dea_output$avg_logFC[1:100]
-  )
-  if (random == TRUE) {
-    random_signature <- sample(rownames(sce), size = 100, replace = FALSE)
-    log_fc_rand <- dea_output[random_signature, "avg_logFC"]
-    log_fc_rand[is.na(log_fc_rand)] <- 0 
-    random_df <- data.frame(gene = random_signature, log_fc = log_fc_rand)
-    output_df <- rbind(output_df, random_df)
-    output_df$is_random <- c(rep(FALSE, 100), rep(TRUE, 100))
-  } 
-  output_df
-}
-
-calc_time_score <- function(sce, signature_df, random = FALSE) {
-  # Calculate time score for every cell in sce.
-  # 
-  # Args: 
-  #   sce: A SingleCellExperiment object.
-  #   signature_df: a dataframe with the variables "gene" (chr vector with the 
-  #                 gene symbols of the signature ordered by importance) and 
-  #                 "sign" (-1 if downregulated, +1 if upregulated). It can 
-  #                 contain a "is_random" to distinguish genes from the random signature.
-  #   random: logical indicating whether or not to calculate random time score.
-  # 
-  # Returns:
-  #   Original sce with a new variable "time_score", which is computed by adding together
-  #   the weighted scaled counts of the genes in the signature. The weights correspond to 
-  #   the inverse ranking in the signature, signed with the direction of the DE. If 
-  #   random = TRUE it adds an extra "time_score_random" variable.
-  
-  row_selection <- rownames(sce) %in% signature_df$gene
-  sce_sub <- sce[row_selection, ]
-  seurat <- Convert(from = sce_sub, to = "seurat")
-  seurat <- ScaleData(seurat)
-  
-  if ("is_random" %in% colnames(signature_df)) {
-    signature_df_sub <- signature_df[!(signature_df$is_random), ]
-  } else {
-    signature_df_sub <- signature_df
-  }
-  
-  signature_df_sub$weight <- rev(1:nrow(signature_df_sub)) * signature_df_sub$sign
-  time_score <- map_dbl(colnames(sce), function(cell) {
-    norm_counts <- seurat@scale.data[as.character(signature_df_sub$gene), cell]
-    sum(norm_counts * signature_df_sub$weight)
-  })
-  sce$time_score <- time_score
-  
-  if (random == TRUE) {
-    signature_df_sub <- signature_df[signature_df$is_random, ]
-    signature_df_sub$weight <- rev(1:nrow(signature_df_sub)) * signature_df_sub$sign
-    time_score_random <- map_dbl(colnames(sce), function(cell) {
-      norm_counts <- seurat@scale.data[as.character(signature_df_sub$gene), cell]
-      sum(norm_counts * signature_df_sub$weight)
-    })
-    sce$time_score_random <- time_score_random
-  }
-  sce
-}
-
 calc_time_score2 <- function(sce, signature_df, random = FALSE) {
   # Calculate time score for every cell in sce.
   # 
@@ -766,74 +801,50 @@ calc_time_score2 <- function(sce, signature_df, random = FALSE) {
   }
   sce
 }
-test_time_score <- function(sce, random = FALSE, return_ROC = FALSE) {
-  # Tests the discriminative power of "time_score" with different accuracies.
+
+find_gene_signature2 <- function(sce, random = FALSE) {
+  # Find top 100 differentially expressed genes between two conditions.
   # 
   # Args: 
-  #   sce: A SingleCellExperiment object with a "label" variable that contains the observed
-  #        classes (affected/unaffected), a time_score and potentially a time_score_random 
-  #        variables.
-  #   random: logical indicating whether the accuracies should be calculated for the real
-  #           time score or for the random one.
-  #   return_ROC: logical indicating whether a data frame containing the TPR and FPR for 
-  #               several time_score cutoffs should be returned or not.
-  # Returns: a data frame with the variables "accuracy_measure" (sensitivity, etc.),
-  #          "value". If return_ROC = TRUE, returns another data frame
-  #          to plot a ROC curve.
-  
-  # Define "prediction" and "performance" objects from the ROCR package
-  if (random) {
-    time_score <- sce$time_score_random
-  } else {
-    time_score <- sce$time_score
-  }
-  labs <- factor(sce$label, c("unaffected", "affected"), ordered = TRUE)
-  pred <- prediction(predictions = time_score, labels = labs)
-  perf <- performance(prediction.obj = pred, measure = "tpr", x.measure = "fpr")
-  
-  # Find index optimal cutoff as the one that maximizes specificity and sensitivity
-  find_opt_cut <- function(perf, pred){
-    cut.ind <- mapply(FUN = function(x, y, p){
-      d <- (x - 0)^2 + (y - 1)^2
-      ind <- which(d == min(d))
-      ind
-    }, perf@x.values, perf@y.values, pred@cutoffs)
-  }
-  ind_opt_cut <- find_opt_cut(perf, pred)
-  
-  # Compute accuracy metrices
-  accuracies <- c("sens", "spec", "acc", "prec")
-  values <- c()
-  for (metric in accuracies) {
-    curr_perf <- performance(pred, metric)
-    value <- curr_perf@y.values[[1]][ind_opt_cut]
-    values <- c(values, value)
-  }
-  accuracies_df <- data.frame(accuracies, values)
-  
-  # Return
-  if (return_ROC == TRUE) {
-    roc_df <- data.frame(fpr = unlist(perf@x.values), tpr = unlist(perf@y.values))
-    list(accuracies = accuracies_df, roc = roc_df)
-  } else {
-    accuracies_df
-  }
-}
-
-find_var_genes <- function(sce) {
-  # Takes a SingleCellExperiment object, finds and filters for HVG. Return SCE
-  fit_var <- trendVar(sce, use.spikes = FALSE) 
-  decomp_var <- decomposeVar(sce, fit_var)
-  top_hvgs <- order(decomp_var$bio, decreasing = TRUE)
-  top_20_pct_hvgs <- top_hvgs[1:(0.2 * length(top_hvgs))]
-  sce <- sce[top_20_pct_hvgs, ]
-  sce
+  #   sce: A SingleCellExperiment object with a "label" binary variable
+  #        which labels cells as "affected" or "unaffected".
+  #   vars_to_regress: chr vector with the variables to regress out.
+  #   random: logical indicating whether or not to find a random singature.
+  # 
+  # Returns:
+  #   A dataframe with 2 variables: "gene" (vector of the top 100 DEG ranked by
+  #   p-value) and "sign" (-1 if downregulated, +1 if upregulated). If random = TRUE,
+  #   100 extra rows are added with random gene symbols from rownames(sce), and a 
+  #   3rd variable "is_random" is added.
+  seurat <- Convert(from = sce, to = "seurat")
+  seurat <- SetAllIdent(object = seurat, id = "label")
+  seurat <- ScaleData(seurat)
+  dea_output <- FindMarkers(
+    seurat, 
+    ident.1 = "affected", 
+    ident.2 = "unaffected", 
+    test.use = "MAST",
+    logfc.threshold = 0
+  )
+  output_df <- data.frame(
+    gene = rownames(dea_output)[1:100],
+    log_fc = dea_output$avg_logFC[1:100]
+  )
+  if (random == TRUE) {
+    random_signature <- sample(rownames(sce), size = 100, replace = FALSE)
+    log_fc_rand <- dea_output[random_signature, "avg_logFC"]
+    log_fc_rand[is.na(log_fc_rand)] <- 0 
+    random_df <- data.frame(gene = random_signature, log_fc = log_fc_rand)
+    output_df <- rbind(output_df, random_df)
+    output_df$is_random <- c(rep(FALSE, 100), rep(TRUE, 100))
+  } 
+  output_df
 }
 
 plot_tsne2 <- function(sce, 
-                      color_by, 
-                      colors,
-                      point_size) {
+                       color_by, 
+                       colors,
+                       point_size) {
   # Plots a tSNE for a given SingleCellExperiment object
   # 
   # Args:
