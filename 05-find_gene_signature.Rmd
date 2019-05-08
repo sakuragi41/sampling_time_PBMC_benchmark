@@ -1,0 +1,432 @@
+---
+title: "Time-induced Gene Signature"
+author: "Ramon Massoni-Badosa"
+date: "2019/04/08"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+The purpose of this notebook is to find the cell type-specific gene signature that drives the observed effect of time on a cell's transcriptome. In other words, for each cell type we want to find the set of genes that change their expression due to the time that the sample spent at room temperature (RT). 
+
+## Description of the classifier
+To meet all the previous requirements, we will use 3-fold cross validation. That is, we will divide 3 times the dataset into training and test sets. For each fold, we will assign randomly 2/3 of the cells to the training set and 1/3 to the test set. We will try to obtain balanced sets, so that they contain approximately the same number of "affected" and "unaffected" cells. We will perform this process for each cell type independently, as we have seen in other analysis that they display considerably different signatures.
+
+We will consider cells from 0h as "unaffected"; and 8h RT, 24h RT and 48h RT as "affected". We will run a differential expression analysis using MAST, which in [this benchmark study](https://www.nature.com/articles/nmeth.4612) was the DEA tool with the best performance. We will subsequently adjust the resulting p-values for multiple comparisons with an FDR correction. Then, we will define the signature as the top 100 differentially expressed genes. Finally, for each cell type we will obtain 3 signatures (one per fold), so we will find a cell type-specific "metasignature" as the intersection of all 3.
+
+The advantage of this approach is that (1) we will repeat the process 3 times, meaning that we will be able to assess the effect of random sampling on the robustness of the results (low variance); and (2) we will use all cells, so the results will be as close as we can get to the true signature (low bias). See a full discussion of the bias-variance tradeoff in Chapter 5 ("Resampling Methods") of the book ["Introduction to Statistical Learning"](https://www-bcf.usc.edu/~gareth/ISL/ISLR%20First%20Printing.pdf), by Gareth James and colleagues.
+
+## Pre-processing
+Let us start by loading the required packages and sourcing the script that contains generic function definitions:
+
+```{r}
+# Load required packages 
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(Seurat)
+library(EnsDb.Hsapiens.v86)
+library(ggpubr)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(SC3)
+library(pheatmap)
+library(BiocStyle)
+library(purrr)
+library(ggrepel)
+library(plotROC)
+library(caret)
+library(ROCR)
+library(pheatmap)
+library(org.Hs.eg.db)
+library(GOstats)
+library(VennDiagram)
+library(ggplotify)
+library(ggridges)
+library(openxlsx)
+library(tidyverse)
+
+# Source script with key functions
+source("bin/utils.R")
+```
+
+Then, we can load the `SingleCellExperiment` object from previous notebooks, and proceed to label cells as "affected" or "unaffected" by time until cryopreservation:
+
+```{r}
+date <- Sys.Date()
+
+# Load SingleCellExperiment normalized and clusterized
+sce_10x <- readRDS("results/R_objects/10X_SingleCellExperiment_clustered.RDS")
+counts(sce_10x) <- as.matrix(counts(sce_10x))
+logcounts(sce_10x) <- as.matrix(logcounts(sce_10x))
+
+# Filter out 4ºC
+sce_10x <- sce_10x %>%
+  scater::filter(temperature != "4ºC")
+
+colData(sce_10x)
+
+# Filter out 2h
+sce_10x <- sce_10x %>%
+  scater::filter(time != "2h")
+
+colData(sce_10x)
+
+# Label cells as "affected" or "unaffected"
+sce_10x <- sce_10x %>% 
+  scater::mutate(label = ifelse(
+    temperature == "room temperature", 
+    "affected", 
+    "unaffected"
+  )) %>% 
+  scater::mutate(label = factor(label, c("unaffected", "affected")))
+```
+
+As we can see, for each cell we have information about its batch (JULIA_03 or JULIA_04), donor (male/female), cell type (Cytotoxic, CD4 T, Monocyte, B), time (0h, 8h, 24h, 48h), temperature (gold/room temperature/4ºC), and label (affected/unaffected). 
+
+## More QC
+We know from bulk RNA-seq experiments that lowly expressed genes tend to have abnormally large fold-changes between conditions. Such fold-changes might represent the effect of noise, as small changes in counts can vary the fold-change a lot. Thus, we will explore this phenomenon with an MA plot (logFC vs mean expression), and we will remove the more extreme cases.
+
+Furthermore, one common assumption in DEA is that the vast majority of genes are not differential expressed. If that is indeed the case, there might be systematic differences between conditions, such as the RNA composition. Again, we can explore this scenario with an MA plot:
+
+```{r}
+# Calculate logFC(unaffected/unaffected)
+log_fc_aff_unaff <- apply(logcounts(sce_10x), 1, function(x) {
+  log2(
+    mean(x[sce_10x$label == "affected"]) / mean(x[sce_10x$label == "unaffected"])
+  )
+})
+
+# Show number of genes by condition
+sce_10x <- calculateQCMetrics(sce_10x)
+cell_coverage_viol <- as.data.frame(colData(sce_10x)) %>% 
+  unite(col = "time", time, temperature, sep = " ") %>% 
+  mutate(time = str_remove(time, " gold")) %>% 
+  mutate(time = factor(time, rev(c("0h", "2h room temperature", "24h 4ºC", "48h 4ºC",
+                               "8h room temperature", "24h room temperature", "48h room temperature")))) %>% 
+  ggplot(aes(time, total_features_by_counts, fill = label)) + 
+  geom_violin() +
+  geom_boxplot(fill = "white", width = 0.15, outlier.shape = NA) +
+  scale_x_discrete("") +
+  scale_y_continuous("Number of detected genes", expand = c(0,0)) +
+  scale_fill_manual("", values = c("royalblue1", "red2"), 
+                    labels = c("not affected", "affected")) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 12), 
+        axis.title.x = element_text(size = 14, face = "bold"),
+        legend.position = "top") +
+  coord_flip()
+
+cumul_dis <- plotScater(
+  sce_10x, 
+  nfeatures = 300, 
+  colour_by = "label", 
+  exprs_values = "counts"
+)
+cumul_dis <- cumul_dis +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_color_manual("", values = c("royalblue1", "red2"), 
+                    labels = c("not affected", "affected")) +
+  theme(axis.title = element_text(size = 14, face = "bold"))
+        
+cell_coverage_qc <- ggarrange(
+  plotlist = list(cell_coverage_viol, cumul_dis), 
+  nrow = 1, 
+  ncol = 2,
+  common.legend = TRUE
+)
+cell_coverage_qc
+
+# Normalize in a condition-specific manner
+sce_10x$clusters <- sce_10x$label
+levels(sce_10x$clusters) <- c(0, 1)
+sce_10x <- computeSumFactors(sce_10x, clusters = sce_10x$clusters)
+summary(sizeFactors(sce_10x))
+sce_genes_filt_norm <- normalize(sce_10x)
+sce_genes_filt_norm <- calculateQCMetrics(sce_genes_filt_norm)
+
+# Correlation size factor with library size
+as.data.frame(colData(sce_genes_filt_norm)) %>% 
+  mutate(size_factors = sizeFactors(sce_genes_filt_norm)) %>% 
+  ggplot(aes(total_counts, size_factors, color = label)) +
+    geom_point() +
+    scale_x_log10("log (Library Size)") +
+    scale_y_log10("log (Size Factor)") +
+    scale_color_manual("", values = c("royalblue1", "red2"))
+
+# MA plot (logFC ~ log(mean_expression))
+ma_df <- data.frame(
+  gene = rownames(sce_10x),
+  mean_logCPM = rowMeans(logcounts(sce_10x)),
+  log_fc = log_fc_aff_unaff
+)
+ma_plot <- ma_df %>% 
+  mutate(exclude = ifelse(log(mean_logCPM) < -4.75, TRUE, FALSE)) %>% 
+  ggplot(aes(log(mean_logCPM), log_fc, color = exclude)) +
+    geom_point() +
+    geom_smooth(method = "loess", color = "darkblue") +
+    geom_vline(xintercept = -4.75, linetype = "dashed", color = "red") +
+    scale_color_manual(values = c("black", "red2")) +
+    labs(x = "log (Average logCPM)", y = "logFC: affected-unaffected") +
+    theme_bw() +
+    theme(axis.title = element_text(size = 15))
+ma_plot
+```
+
+Importantly, we see that our data suffers from an important bias: "unaffected" cells tend to have more detected genes than "affected". Importantly `scran` normalization corrects mostly for library size, but we can also see that the scatter across the regression line corresponds to the other bias it corrects: RNA composition.
+
+Moreover, from the MA-plot we can observe 2 biases:
+
+1. Genes with fewer counts tend to have larger fold changes.
+2. The unaffected genes tend to have more counts than the affected. Thus, all genes tend to be slightly downregulated.
+
+To correct for bias (1) we will rule out those genes that have a mean log(CPM) < -4.75. For bias (2) we will be stringent with the cutoffs in the DEA:
+
+```{r}
+table(log(ma_df$mean_logCPM) > -4.75)
+sce_10x <- sce_10x[log(ma_df$mean_logCPM) > -4.75, ]
+saveRDS(object = sce_10x, "results/R_objects/sce_10x.rds")
+```
+
+# Divide cells in training and test sets
+As we have stated above, we will find a time-dependent signature for each cell type (CD4 T/Cytotoxic/Monocyte/B cell). Thus, first we split the SCE into a list of 4 SCEs, one per cell type:
+
+```{r}
+# sce_10x <- readRDS("results/R_objects/sce_10x.rds")
+sce_list <- list(
+  "CD4 T" = sce_10x[, sce_10x$cell_type == "CD4 T"],
+  "CD8 T" = sce_10x[, sce_10x$cell_type == "CD8 T"],
+  "NK" = sce_10x[, sce_10x$cell_type == "NK"],
+  "Monocyte" = sce_10x[, sce_10x$cell_type == "Monocyte"],
+  "B" = sce_10x[, sce_10x$cell_type == "B"]
+)
+```
+
+Now, for each of these SCEs we will define 3 equally-sized sets of cells, which later will act as test sets in the cross-validation. Our only requirement is that they are balanced, meaning that for each set the conditions "affected" and "unaffected" should be represented by approximately the same number of cells. To that end, we will sample without replacement, weigtheing the sampling procedure by the label, such that underrepressented cell (i.e. "affected") are more likely to be chosen:
+
+```{r}
+set.seed(1)
+cell_types <- levels(sce_10x$cell_type)
+sce_test_list <- list(
+  "CD4 T" = list(), 
+  "CD8 T" = list(), 
+  "NK" = list(), 
+  "Monocyte" = list(), 
+  "B" = list()
+)
+sce_train_list <- sce_test_list
+for (cell_type in cell_types) {
+  current_sce <- sce_list[[cell_type]]
+  selected_cells <- c()
+  size_set <- floor(ncol(sce_list[[cell_type]]) / 3)
+  for (fold in 1:2) {
+    df <- colData(current_sce) %>% 
+      as.data.frame() %>% 
+      rownames_to_column(var = "barcode") %>%
+      dplyr::mutate(weight = ifelse(
+        label == "affected", 
+        mean(label == "unaffected"),
+        mean(label == "affected"))) 
+    sub_df <- sample_n(df, size = size_set, replace = FALSE, weight = weight)
+    sce_test_list[[cell_type]][[fold]] <- sce_list[[cell_type]][, sub_df$barcode]
+    train_cols <- !(colnames(sce_list[[cell_type]]) %in% sub_df$barcode)
+    sce_train_list[[cell_type]][[fold]] <- sce_list[[cell_type]][, train_cols]
+    selected_cells <- c(selected_cells, sub_df$barcode)
+    current_sce <- current_sce[, !(colnames(current_sce) %in% selected_cells)]
+    size_set <- floor(ncol(current_sce) / 2)
+    if (fold == 2) {
+      sce_test_list[[cell_type]][[3]] <- current_sce
+      train_cols <- !(colnames(sce_list[[cell_type]]) %in% colnames(current_sce))
+      sce_train_list[[cell_type]][[3]] <- sce_list[[cell_type]][, train_cols]
+    }
+  }
+}
+saveRDS(sce_test_list, "results/R_objects/sce_test_list.rds")
+```
+
+# Find gene signature
+For every traning set, we will perform a differential expression analysis between "affected" and "unaffected" cells, and establish the gene signature as the top 100 significant DEG. Furthermore, we will find a random signature by shuffling the rows in the training SCE and getting the first 100 random genes.
+
+```{r}
+gene_signatures <- list(
+  "CD4 T" = list(), 
+  "CD8 T" = list(), 
+  "NK" = list(), 
+  "Monocyte" = list(), 
+  "B" = list()
+)
+for (type in cell_types) {
+  gene_signatures[[type]] <- map(
+    sce_train_list[[type]], 
+    find_gene_signature,
+    n_genes = 300,
+    random = TRUE
+  )
+}
+saveRDS(gene_signatures, file = "results/R_objects/gene_signatures.rds")
+```
+
+# Meta-signatures
+Let us define a "meta-signature" for each cell type as those genes that showed up in the signatures of all 3 folds:
+
+```{r}
+metasignatures <- map(cell_types, function(type) {
+  signatures <- map(gene_signatures[[type]], function(sign) {
+    sign %>% 
+      dplyr::filter(!is_random) %>% 
+      dplyr::select(gene) %>% 
+      unlist()
+  })
+  Reduce(intersect, signatures)
+})
+names(metasignatures) <- cell_types
+saveRDS(object = metasignatures, file = "results/R_objects/metasignatures.rds")
+metasignatures
+
+# Output table with meta-signatures and average logFC and adjusted p-values
+out_tables <- map2(gene_signatures, metasignatures, function(sign_l, meta) {
+  sign_l %>% 
+    map(~ .[!.$is_random, ]) %>% 
+    map(~ .[match(meta, .$gene), ]) %>% 
+    set_names(c("fold1", "fold2", "fold3")) %>% 
+    bind_rows(.id = "fold") %>% 
+    group_by(gene) %>% 
+    summarise(avg_p_val_adj = mean(p_val_adj), avg_log_fc = mean(log_fc)) %>% 
+    arrange(avg_p_val_adj)
+})
+file <-  "results/tables/metasignatures_cell_types.xlsx"
+openxlsx::write.xlsx(out_tables, file = file)
+```
+
+## Overlapping
+To confirm that they are indeed cell-type specific, let us assess the intersection between the four sets with a heatmap:
+
+```{r}
+all_genes <- Reduce(union, metasignatures)
+matr_meta <- matrix(, nrow = length(all_genes), ncol = length(cell_types))
+for (i  in 1:length(all_genes)) {
+  new_row <- as.numeric(map_dbl(metasignatures, ~ all_genes[i] %in% .))
+  matr_meta[i, ] <- new_row
+}
+rownames(matr_meta) <- all_genes
+colnames(matr_meta) <- names(metasignatures)
+matr_meta <- matr_meta[order(rowSums(matr_meta), decreasing = TRUE), ]
+cols <- colorRampPalette(c("gray99", "brown2"))(2)
+heatmap_metasignatures <- pheatmap(
+  matr_meta, 
+  color = cols, 
+  cluster_rows = FALSE, 
+  cluster_cols = FALSE, 
+  fontsize = 5,
+  gaps_col = 1:4,
+  legend = FALSE,
+  show_rownames = FALSE, 
+  show_colnames = TRUE,
+  fontsize_col = 12,
+  angle_col = 45
+)
+pdf(
+  file = str_c("results/plots/", date, "_heatmap_metasignatures.pdf"), 
+  height = 12, 
+  width = 4
+)
+print(heatmap_metasignatures)
+dev.off()
+saveRDS(object = heatmap_metasignatures, file = "results/R_objects/heatmap_all_metasignatures.rds")
+```
+
+
+Similar idea, but using a Venn diagram:
+
+```{r}
+vp <- venn.diagram(metasignatures, 
+  fill = 2:6, 
+  alpha = 0.75, 
+  filename = NULL
+)
+saveRDS(object = vp, "results/R_objects/venn_diagram_metasignatures.rds")
+pdf(str_c("results/plots/", date, "_venn_metasignatures.pdf"), height = 7, width = 7)
+grid.draw(vp)
+dev.off()
+grid.draw(vp)
+```
+
+## Common genes in all 4 metasignatures
+As we can see, there are 32 genes that are common between all 5 metasignatures. Let us elucidate their identity and how its expression changes across conditions:
+
+```{r}
+times <- c("0h", "8h", "24h", "48h")
+genes <- Reduce(intersect, metasignatures)
+sce_meta <- sce_10x[genes, order(sce_10x$label)]
+seurat_meta <- Convert(sce_meta, to = "seurat")
+seurat_meta <- ScaleData(seurat_meta, vars.to.regress = "batch")
+expr_matr <- as.matrix(seurat_meta@scale.data)
+meta_df <- data.frame(
+  time = c(), 
+  gene = c(),
+  expression = c(), 
+  fraction_expr = c()
+)
+
+for (t in times) {
+  for (g in genes) {
+    expr <- mean(expr_matr[g, colnames(sce_meta[, sce_meta$time == t])])
+    frc_expr <- mean(counts(sce_meta[g, sce_meta$time == t]) != 0) 
+    current_df <- data.frame(
+      gene = g, 
+      time = t, 
+      expression = expr, 
+      fraction_expr = frc_expr
+    )
+    meta_df <- rbind(meta_df, current_df)
+  }
+}
+dot_plot_metasignatures <- meta_df %>% 
+  ggplot(aes(x = time, y = gene, color = expression)) +
+    geom_point(size = 3) +
+    scale_colour_gradientn(colours = c("blue","white","red")) +
+    labs(x = "", y = "") +
+    theme_classic() +
+    theme(axis.text = element_text(size = 13), 
+          legend.text = element_text(size = 13), 
+          legend.title = element_text(size = 13), 
+          legend.position = "bottom", 
+          legend.box = "vertical")
+dot_plot_metasignatures
+ggsave(
+  filename = str_c("results/plots/", date, "_dot_plot_metasignatures.pdf"),
+  plot = dot_plot_metasignatures, 
+  width = 3, 
+  height = 8
+)
+saveRDS(object = dot_plot_metasignatures, file = "results/R_objects/dot_plot_metasignatures.rds")
+```
+
+Strikingly, most common genes tend to be highly expressed house-keeping genes, such as ACTB oro TMSB4X:
+
+```{r}
+df_geom_text <-  ma_df %>% 
+  dplyr::mutate(exclude = ifelse(log(mean_logCPM) < -4.75, TRUE, FALSE)) %>% 
+  dplyr::filter(gene %in% genes)
+ma_plot +
+  geom_text_repel(data = df_geom_text, aes(label = gene), color = "turquoise2", fontface = "bold")
+```
+
+Therefore, in the next notebook we need to validate our signatures thoroughly to ensure there is no bias towards detecting highly expressed genes.
+
+# Session info
+
+```{r}
+sessionInfo()
+```
+
+

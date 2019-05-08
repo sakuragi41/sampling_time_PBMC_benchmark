@@ -1,0 +1,300 @@
+---
+title: "Clustering"
+author: "Ramon Massoni-Badosa"
+date: "2019/04/09"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+
+# Introduction
+
+In previous notebooks, we have assigned each cell to its condition (0h, 8h, etc.), we have filtered low-quality cells, and we have normalized gene counts to correct for biases such as differences in library size. The result of that is a `SingleCellExperiment` object that we saved as .RDS and that will be our starting point in this analysis.
+
+Here, we aim to cluster cells to identify each cell type. Hence, we are going to use [Seurat](https://satijalab.org/seurat/), a CRAN package that has become a swiss-knife for scRNA-seq analysis. As described in [Kiselev *et al*](https://www.nature.com/articles/s41576-018-0088-9), Seurat uses a graph-based clustering algorithm that is scalable to datasets with thousands of cells. Therefore, we will leverage such scalability to cluster >11,000 cells contained in the SCE object.
+
+## Package loading
+
+```{r}
+library(stringr)
+library(psych)
+library(pheatmap)
+library(fitdistrplus)
+library(ggpubr)
+library(SingleCellExperiment)
+library(scater)
+library(Seurat)
+library(purrr)
+library(grid)
+library(gridExtra)
+library(gridGraphics)
+library(cowplot)
+library(matchSCore2)
+library(nnet)
+library(Matrix)
+library(tidyverse)
+```
+
+# Create seurat object
+Seurat uses its own single-cell data container, a so-called `Seurat` object. Hence, we first need to convert the SCE to this new data structure:
+
+```{r}
+date <- Sys.Date()
+
+# Load SingleCellExperiment
+sce <- readRDS("results/R_objects/10X_SingleCellExperiment_filt&norm.RDS")
+
+# To increase interpretability downstream, change rownames from ensembl to gene 
+# symbol
+rowData(sce)$name %>% 
+  table() %>% 
+  sort(decreasing = TRUE) %>% 
+  head(10)
+ind <- match(c("PNRC2", "SRSF10"), rowData(sce)$name)
+rowData(sce)$name[ind] <- c("PNRC2.1", "SRSF10.1")
+rownames(sce) <- rowData(sce)$name
+
+# Convert SCE to Seurat
+seurat <- Convert(from = sce, to = "seurat")
+```
+
+# Find Variable Genes
+To cluster our cells, we need to overcome 2 challenges:
+
+1. The 'curse of dimensionality': as each cell can be conceived as a vector with >10,000 genes, and as two random cells will have most of each genes equal, the distance measured between any given pair of cells will be very low, thus being unreliable for proper comparisons.
+2. Computational complexity: as the data is highly dimensional, even the most greedy algorithm will take long to complete. 
+3. Most genes should not be differentially expressed between cells, so the observed differences in such genes will be due to technical issues or transient biological states, that may confound the true structure in the dataset.
+
+A first approach to tackle these challenges consists of finding the most variable genes as a means of feature selection. That is, to find the subset of genes that drive most of the variability in the expression matrix. Seurat calculates the average expression and dispersion for each gene. Then, it divides genes into bins based on its average, and for each bin computes a z-score per gene. Those genes with a z-score above a certain cutoff are categorized as highly variable. The binning step is vital, since genes with more UMI tend to have more dispersion.
+
+```{r}
+seurat <- FindVariableGenes(seurat, display.progress = FALSE)
+length(seurat@var.genes)
+```
+
+As we can see, we reduce the number of dimensions from >10,000 genes to 319 HVG.
+
+# Scale data
+An important pre-processing step in any cluster analysis is to scale the data, as otherwise variables with a higher mean will have a higher weight in the distance metric. Remember that we observed batch effects, so we regress out the "batch" variable:
+
+```{r}
+seurat <- ScaleData(seurat, vars.to.regress = "batch")
+```
+
+# Linear dimensionality reduction (PCA)
+An additional challenge in our cluster analysis is that scRNAs-seq is very noisy (very susceptible to technical artifacts), and very sparse (contains drop-outs). Thus, differences in single genes may not be accurate to identify cell types. To that end, we can perform Principal Component Analysis, as PC can be conceived as a 'metagene' that includes information across a correlated gene set. Furthermore, we will reduce the dimensionality even more.
+
+```{r}
+seurat <- RunPCA(
+  object = seurat,
+  pc.genes = seurat@var.genes,
+  do.print = TRUE,
+  pcs.print = 1:5,
+  genes.print = 5
+)
+VizPCA(object = seurat, pcs.use = 1:2)
+PCHeatmap(
+  object = seurat, 
+  pc.use = 1, 
+  cells.use = 500, 
+  do.balanced = TRUE, 
+  label.columns = FALSE
+)
+```
+
+
+# Determine statistically significant principal components
+To determine the number of significant PCs to use, we will take advantage of a scree plot. That is, we will plot the variance explained by each PC in an ordered manner. We identify the number of significant PCs as the one in which we can observe an "elbow" (i.e. the reduction in explained variance diminishes):
+
+```{r}
+PCElbowPlot(seurat)
+```
+
+The elbow is in PC4, so that is what we are going to use to cluster cells using the `FindClusters` function.
+
+# Cluster cells
+Seurat uses the Louvain algorithm to cluster cells:
+
+```{r}
+seurat <- FindClusters(
+  object = seurat,
+  reduction.type = "pca",
+  dims.use = 1:4,
+  resolution = 0.2,
+  print.output = 0
+)
+```
+
+# Non-linear dimensionality reduction (tSNE)
+We can visualize the former clusters with a t-Stochastic Neighbor Embedding (tSNE), which allows to depict more structure in the data than PCA:
+
+```{r}
+set.seed(1)
+seurat <- RunTSNE(seurat, dims.use = 1:4)
+TSNEPlot(seurat)
+```
+
+As we can see, there are 4 major clusters. Interestingly:
+
+```{r}
+seurat@meta.data$cluster <- seurat@ident
+seurat  <- SetAllIdent(seurat, "batch")
+TSNEPlot(seurat)
+```
+
+Regressing out the batch effect with the `ScaleData` function from above removed the majority of the batch effect.
+
+# Find differentially expressed genes (cluster biomarkers)
+Let us find the markers of each of the clusters above. In other words, let us find which genes are exclusively expressed in each cluster and will help us identify the cell types in our data set:
+
+```{r}
+seurat  <- SetAllIdent(seurat, "cluster")
+cluster_markers <- map(0:4, ~ FindMarkers(seurat, ident.1 = ., mon.pct = 0.25))
+map(cluster_markers, head, 10)
+```
+
+## Assigning cell type identity to clusters
+Based on the previously found markers, we can annotate each cluster to known cell types:
+
+Cluster ID | Markers       | Cell Type
+-----------|---------------|----------
+0          | IL7R          | CD4 T cells
+1          | CD8A          | CD8 T cells
+2          | GNLY, NKG7    | Natural Killer (NK)
+3          | LYZ           | Monocytes
+4          | MS4A1         | B cells
+
+```{r}
+new_cluster_ids <- c("CD4 T", "CD8 T", "NK", "Monocyte", "B")
+levels(seurat@ident) <- new_cluster_ids
+markers_gg_l <- FeaturePlot(
+  object = seurat, 
+  features.plot = c("IL7R", "CD8A", "GNLY", "LYZ", "MS4A1"), 
+  cols.use = c("grey", "blue"),
+  do.return = TRUE
+)
+
+markers_gg_l <- map(markers_gg_l, function(gg) {
+  gg +
+    theme(plot.title = element_text(face = "plain", size = 12),
+          axis.line = element_blank(), 
+          axis.ticks = element_blank(), 
+          axis.text = element_blank(), 
+          axis.title = element_blank())
+})
+markers_gg <- ggarrange(
+  plotlist = markers_gg_l, 
+  ncol = 2, 
+  nrow = 3, 
+  labels = "auto", 
+  font.label = list(size = 14)
+)
+ggsave(
+  filename = str_c("results/plots/", date, "_cell_type_markers.pdf"), 
+  plot = markers_gg, 
+  device = "pdf", 
+  width = 10, 
+  height = 10
+)
+markers_gg
+
+tsne_cell_types <- TSNEPlot(seurat) 
+tsne_cell_types <- tsne_cell_types +
+  scale_color_manual(values = c("#c20a35", "#aa2edc", "#71bdd0", "#bbaa2a", "chartreuse3"),
+                     labels = c("CD4 T", "CD8 T", "NK", "Monocytes", "B")) +
+  theme(axis.line = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        axis.title = element_blank(), 
+        panel.border = element_blank(), 
+        legend.text = element_text(size = 13))
+ggsave(
+  filename = str_c("results/plots/", date, "_cell_type_tsne.pdf"), 
+  plot = tsne_cell_types, 
+  device = "pdf", 
+  width = 11, 
+  height = 10
+)
+tsne_cell_types
+
+# Clustering figure
+legend <- as_ggplot(get_legend(tsne_cell_types))
+tsne_cell_types <- tsne_cell_types +
+  theme(legend.position = "none")
+clustering_figure <- plot_grid(
+  markers_gg, 
+  NULL, 
+  tsne_cell_types, 
+  ncol = 3, 
+  nrow = 1, 
+  rel_widths = c(0.9, 0.05, 1.1),
+  labels = c("", "", "f"),
+  label_size = 14
+)
+ggsave(
+  filename = str_c("doc/figures/R/", date, "_clustering_figure.pdf"), 
+  plot = clustering_figure, 
+  device = "pdf", 
+  width = 19, 
+  height = 11,
+  units = "cm"
+)
+ggsave(
+  filename = str_c("doc/figures/legends/", date, "legend_clustering_figure.pdf"), 
+  plot = legend, 
+  device = "pdf", 
+  width = 2, 
+  height = 2
+)
+```
+
+## Convert back to SingleCellExperiment and save
+
+```{r}
+# Convert to SCE
+sce2 <- Convert(from = seurat, to = "sce")
+
+# Recode colData variables
+colData(sce2) <- colData(sce2)[, c("batch", "donor", "ident", "condition")]
+conds <- c("0h", "2h", "8h", "24h_RT", "48h_RT", "24h_4C", "48h_4C")
+sce2$condition <- factor(sce2$condition, levels = conds)
+
+levels(sce2$condition) <- conds %>% 
+  str_remove("RT") %>% 
+  str_remove("_")
+sce2$temperature <- case_when(
+  sce2$condition == "0h" ~ "gold",
+  sce2$condition %in% c("2h", "8h", "24h", "24hBioabank", "48h") ~ "room temperature",
+  sce2$condition %in% c("24h4C", "48h4C") ~ "4ºC"
+)
+sce2$condition <- str_remove(as.character(sce2$condition), "4C")
+colnames(colData(sce2)) <- c("batch", "sex", "cell_type", "time", "temperature")
+
+# Recode rowData variables
+rowData(sce2) <- rowData(sce)
+
+# Save as RDS
+saveRDS(sce2, "results/R_objects/10X_SingleCellExperiment_clustered.RDS")
+```
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+

@@ -1,0 +1,586 @@
+---
+title: "Validate Gene Signature"
+author: "Ramon Massoni-Badosa"
+date: "01/16/2018"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+The purpose of this notebook is to validate the time-induced gene signatures we found in the previous notebook. To that end, we will compute a "time-score", a metric that encapsulates the gene signature and quantifies the effect of time on a cell's transcriptome. Once we have this metric, we can validate the signatures from different perspectives:
+
+1. Discriminative power: can we predict whether an unseen cell is "affected" or "unaffected" by time just by computing the time score?
+2. Time-dependency: we have seen several times that the effect of time is gradual, so we expect that this is captured  by the time-score, as well as by the expression of the most important genes in the signatures.
+3. Biological significance: are the gene sets enriched in any particular Gene Ontology (GO) term? If the gene signature is indeed real, we would expect it to be enriched in terms that have been related in PBMC homeostasis in previous studies.
+4. Technology-independency: can we reach the same conclusions with gene expression profiles obtained from another technology (Smart-seq2)? (next notebook).
+
+# Pre-processing
+Load required packages:
+
+```{r}
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(Seurat)
+library(EnsDb.Hsapiens.v86)
+library(ggpubr)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(SC3)
+library(pheatmap)
+library(BiocStyle)
+library(purrr)
+library(ggrepel)
+library(plotROC)
+library(caret)
+library(ROCR)
+library(pheatmap)
+library(org.Hs.eg.db)
+library(GOstats)
+library(VennDiagram)
+library(ggplotify)
+library(scales)
+library(ggridges)
+library(ggrepel)
+library(openxlsx)
+library(tidyverse)
+```
+
+Source function scripts:
+
+```{r}
+source("bin/utils.R")
+```
+
+Load data:
+
+```{r}
+date <- Sys.Date()
+
+# Load SingleCellExperiment object
+sce_10x <- readRDS("results/R_objects/sce_10x.rds")
+
+# Load list with gene signatures
+gene_signatures <- readRDS("results/R_objects/gene_signatures.rds")
+
+# Load list with metasignatures
+metasignatures <- readRDS("results/R_objects/metasignatures.rds")
+
+# Load test sets
+sce_test_list <- readRDS("results/R_objects/sce_test_list.rds")
+```
+
+# Calculate time-score
+Our requirements to define the time-score are two-fold. First, we want to give more weight to those genes that have a larger fold-change between "affected" and "unaffected" cells. Second, we want to consider the sign of the fold-change. Thus, if a gene in the matrix is overexpressed in a cell, but in the signature it was found as underexpressed, its weight will be very low. To achieve that, we perform the follwing steps:
+
+1. Rank genes in the signatures by decreasing abolute logFC.
+2. To ensure that the logFC is independent of scale, we normalize it by taking its rank or quantile in the signature rather than its value, while keeping its sign.
+3. Compute the time-score for a given cell by adding up all the z-scores of the genes in the signature weigthed by the normalized logFC.
+
+```{r}
+sce_test_list_scored <- list(
+  "CD4 T" = list(), 
+  "CD8 T" = list(), 
+  "NK" = list(), 
+  "Monocyte" = list(), 
+  "B" = list()
+)
+
+cell_types <- levels(sce_10x$cell_type)
+for (type in cell_types) {
+  sce_test_list_scored[[type]] <- map2(
+    sce_test_list[[type]], gene_signatures[[type]], 
+    function(sce, signature) {
+      calc_time_score(
+        sce = sce, 
+        signature_df = signature, 
+        random = TRUE
+      )
+  })
+}
+```
+
+
+# Test time-score
+
+## Time-dependency
+First of all, let us assess whether "unaffected" and "affected" cells have indeed a different distribution of the time-score variable:
+
+```{r}
+# Add time-score as a new variable in the metadata of sce_10x
+time_score_list <- list(
+  "CD4 T" = list(), 
+  "CD8 T" = list(), 
+  "NK" = list(), 
+  "Monocyte" = list(), 
+  "B" = list()
+)
+for (type in cell_types) {
+  time_score_list[[type]] <- map(sce_test_list_scored[[type]], function(sce) {
+    data.frame(barcodes = colnames(sce), time_score = colData(sce)$time_score)
+  })
+  time_score_list[[type]] <- bind_rows(time_score_list[[type]])
+}
+time_score_df <- bind_rows(time_score_list)                           
+sce_10x <- sce_10x[, time_score_df$barcodes]
+sce_10x$time_score <- time_score_df$time_score
+saveRDS(sce_10x, "results/R_objects/sce_10x_scored.rds")
+
+# Plot time-score vs time (all cells)
+time_gg <- colData(sce_10x) %>% 
+  as.data.frame() %>% 
+  mutate(time = factor(time, c("0h", "8h", "24h", "48h"))) %>% 
+  ggplot(aes(time, time_score, fill = label)) +
+    geom_violin() +
+    geom_boxplot(fill = "white", width = 0.15, outlier.shape = NA) +
+    scale_x_discrete("") +
+    scale_y_continuous("time score", expand = c(0,0)) +
+    scale_fill_manual("", values = c("royalblue1", "red2"), 
+                      labels = c("unaffected", "affected")) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 12), 
+          axis.title.y = element_text(size = 14, face = "bold")) 
+ggsave(
+  plot = time_gg, 
+  filename = str_c("results/plots/", date, "_",  "time_score_violin.pdf"),
+  height = 8,
+  width = 9
+)
+saveRDS(time_gg, file = "results/R_objects/violin_time_score_gg.rds")
+time_gg
+
+# Plot time-score vs time (faceted by cell type)
+time_gg_facet <- colData(sce_10x) %>% 
+  as.data.frame() %>% 
+  mutate(time = factor(time, c("0h", "8h", "24h", "48h"))) %>% 
+  ggplot(aes(time, time_score, fill = label)) +
+    geom_violin() +
+    geom_boxplot(fill = "white", width = 0.15, outlier.shape = NA) +
+    facet_grid(.~cell_type) +
+    scale_x_discrete("") +
+    scale_y_continuous("time score", expand = c(0,0)) +
+    scale_fill_manual("", values = c("royalblue1", "red2"), 
+                      labels = c("unaffected", "affected")) +
+    theme_classic() +
+    theme(axis.text = element_text(size = 12), 
+          axis.title.y = element_text(size = 14, face = "bold")) 
+ggsave(
+  plot = time_gg_facet, 
+  filename = str_c("results/plots/", date, "_",  "time_score_violin_faceted.pdf"),
+  height = 5,
+  width = 13
+)
+saveRDS(time_gg_facet, file = "results/R_objects/violin_time_score_faceted_gg.rds")
+time_gg_facet
+```
+
+As we can see, time-score captures the time-dependency seen in the tSNEs from previous notebooks. Let us visualize this pattern in 3 key genes: ACTB, PFN1 and ARPC1B:
+
+```{r}
+actin_gg <- map(c("ACTB", "PFN1", "ARPC1B"), function(gene) {
+  counts <- logcounts(sce_10x)[gene, ]
+  colData(sce_10x) %>% 
+    as.data.frame() %>% 
+    mutate(counts = counts,
+           time = factor(time, rev(c("0h", "2h", "8h", "24h", "48h")))) %>% 
+    dplyr::filter(temperature != "4ºC") %>% 
+    ggplot(aes(x = counts, y = time, fill = label)) +
+      geom_density_ridges(bandwidth = 0.25, alpha = 0.85) +
+      theme_bw() +
+      scale_fill_manual(values = c("royalblue1", "red2")) +
+      ggtitle(gene) +
+      labs(x = "normalized counts", y = "", fill = "") +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+})
+actin_gg_ar <- ggarrange(
+  plotlist = actin_gg, 
+  ncol = 3, 
+  nrow = 1, 
+  common.legend = TRUE
+)
+ggsave(
+  plot = actin_gg_ar, 
+  filename = str_c("results/plots/", date, "_",  "actin_ridge_plot.pdf"),
+  height = 8,
+  width = 12
+)
+actin_gg_ar
+```
+
+## Discriminative power
+The second validation consists of assessing whether time-score can correctly predict if an unseen cell is affected or not by time. Thus, we can take advantage of the Receiver-Operating Characteristic (ROC) curve, which relates, for different classifying threshold of time-score, the True Positive Rate (= sensitivity) to the False Positive Rate (= 1 - specificity). The best classifier would be the one that reaches a very high TPR with a very low FPR, whilst a random classifier would be located along the x = y diagonal. We will also plot the ROC of the random singatures to assess if random time-scores are also predictive:
+
+```{r}
+# Real signature
+test_results <- list(
+  "CD4 T" = list(), 
+  "CD8 T" = list(), 
+  "NK" = list(), 
+  "Monocyte" = list(), 
+  "B" = list()
+)
+for (type in cell_types) {
+  test_results[[type]] <- map(sce_test_list_scored[[type]], function(sce) {
+    test_time_score(
+      sce = sce, 
+      random = FALSE, 
+      return_ROC = TRUE
+    )
+  })
+  names(test_results[[type]]) <- str_c("fold", 1:3)
+}
+
+# Random
+test_results_random <- list(
+  "CD4 T" = list(), 
+  "CD8 T" = list(), 
+  "NK" = list(), 
+  "Monocyte" = list(), 
+  "B" = list()
+)
+for (type in cell_types) {
+  test_results_random[[type]] <- map(sce_test_list_scored[[type]], function(sce) {
+    test_time_score(
+      sce = sce, 
+      random = TRUE, 
+      return_ROC = TRUE
+    )
+  })
+  names(test_results_random[[type]]) <- str_c("fold", 1:3)
+}
+
+# ROC
+roc_df_real <- test_results %>% 
+  map(~ map(., 2)) %>% 
+  map(~ bind_rows(., .id = "fold")) %>%
+  bind_rows(.id = "cell_type")
+roc_df_random <- test_results_random %>% 
+  map(~ map(., 2)) %>% 
+  map(~ bind_rows(., .id = "fold")) %>%
+  bind_rows(.id = "cell_type")
+roc_df <- list(real = roc_df_real, random = roc_df_random) %>% 
+  bind_rows(.id = "is_random") %>% 
+  mutate(is_random = ifelse(is_random == "random", TRUE, FALSE))
+
+roc_gg <- roc_df %>% 
+  mutate(cell_type = factor(cell_type, cell_types)) %>% 
+  ggplot(aes(fpr, tpr, color = is_random, linetype = fold)) +
+    geom_line() +
+    labs(x = "False Positive Rate", y = "True Positive Rate") +
+    scale_color_manual(values = c("chartreuse2", "ivory4")) +
+    labs(x = "False Positive Rate", y = "True Positive Rate", color = "random", linetype = "") +
+    facet_grid(~ cell_type) +
+    theme_bw() +
+    theme(axis.title = element_text(size = 13, face = "bold"),
+          strip.text = element_text(size = 12),
+          legend.text = element_text(size = 12))
+ggsave(
+  plot = roc_gg, 
+  filename = str_c("results/plots/", date, "_",  "roc_time_score.pdf"),
+  height = 4.5,
+  width = 12
+)
+roc_gg
+saveRDS(roc_gg, file = "results/R_objects/roc_curve.rds")
+
+# Only CD4 T cells
+roc_gg_cd4 <- roc_df %>% 
+  mutate(cell_type = factor(cell_type, cell_types)) %>% 
+  dplyr::filter(cell_type == "CD4 T") %>% 
+  ggplot(aes(fpr, tpr, color = is_random, linetype = fold)) +
+  geom_line() +
+  labs(x = "False Positive Rate", y = "True Positive Rate") +
+  scale_color_manual(values = c("chartreuse2", "ivory4")) +
+  labs(x = "False Positive Rate", y = "True Positive Rate", color = "random", linetype = "") +
+  theme_bw() +
+  theme(axis.title = element_text(size = 13, face = "bold"),
+        strip.text = element_text(size = 12),
+        legend.text = element_text(size = 12))
+
+saveRDS(roc_gg_cd4, file = "results/R_objects/roc_curve_cd4t.rds")
+```
+
+Indeed, we see how our classifier maximizes the TPR/FPR relationship. However, the random classifier is slightly predictive, which can relate to the fact that unaffected cells were slightly systematically downregulated (as we saw in the previous notebook).
+
+We can also plot the distributions of the accuracy metrics:
+
+```{r}
+acc_df_real <- test_results %>% 
+  map(~ map(., 1)) %>% 
+  map(~ bind_rows(., .id = "fold")) %>%
+  bind_rows(.id = "cell_type")
+acc_df_random <- test_results_random %>% 
+  map(~ map(., 1)) %>% 
+  map(~ bind_rows(., .id = "fold")) %>%
+  bind_rows(.id = "cell_type")
+acc_df <- list(real = acc_df_real, random = acc_df_random) %>% 
+  bind_rows(.id = "is_random") %>% 
+  mutate(is_random = ifelse(is_random == "random", TRUE, FALSE))
+
+acc_gg <- acc_df %>% 
+  mutate(cell_type = factor(cell_type, cell_types),
+         values = round(values * 100, 2),
+         accuracies = factor(accuracies, c("sens", "spec", "prec", "acc"))) %>% 
+  mutate() %>% 
+  ggplot(aes(accuracies, values, fill = is_random)) +
+    geom_boxplot() +
+    facet_grid(~cell_type) +
+    scale_y_continuous(limits = c(0, 100), 
+                       breaks = c(0, 25, 50, 75, 100),
+                       labels = c("0%", "25%", "50%", "75%", "100%")) +
+    scale_x_discrete(labels = c("sensitivity", "specificity", "precision", "accuracy")) +
+    scale_fill_manual(values = c("chartreuse2", "ivory4")) +
+    labs(x = "", y = "", fill = "random") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, size = 10, vjust = 1.1, hjust = 1),
+          strip.text = element_text(size = 12))
+ggsave(
+  plot = acc_gg, 
+  filename = str_c("results/plots/", date, "_",  "accuracy_time_score.pdf"),
+  height = 4.5,
+  width = 12
+)
+acc_gg
+
+plot_list <- list(time_gg_facet, roc_gg, acc_gg)
+saveRDS(object = plot_list, file = "results/R_objects/validation_plots.rds")
+```
+
+Let us arrange the violin, ROC and accuracy metrics plots into one single figure:
+
+```{r}
+plot_list <- list(time_gg_facet, roc_gg, acc_gg)
+plot_list <- map(plot_list, function(gg) {
+  gg + 
+    theme(legend.position = "none", 
+          strip.background = element_rect(fill = "white"))
+})
+metasign_valid_gg <- ggarrange(
+  plotlist = plot_list, 
+  ncol = 1, 
+  nrow = 3, 
+  labels = "auto", 
+  align = "v"
+)
+ggsave(
+  filename = str_c("doc/figures/R/", date, "_validation_figure.pdf"), 
+  plot = metasign_valid_gg, 
+  width = 19, 
+  height = 22,
+  units = "cm"
+)
+metasign_valid_gg
+```
+
+In conclusion, we can state that our metric has a high discriminative power.
+
+## GO enrichment gene signatures
+The third and final validation consists of assessing whether signatures enrich for biological functions that are relevant for PBMC homeostasis:
+
+```{r}
+# meta_signature_entrez <- map(metasignatures, function(signature) {
+#   meta_signature_entrez <- AnnotationDbi::select(
+#     x = org.Hs.eg.db, 
+#     keys = signature, 
+#     keytype = "SYMBOL",
+#     columns = "ENTREZID"
+#   )$ENTREZID
+#   meta_signature_entrez
+# })
+# meta_signature_entrez <- Reduce(intersect, meta_signature_entrez)
+# universe_entrez <- AnnotationDbi::select(
+#     x = org.Hs.eg.db, 
+#     keys = rownames(sce_10x), 
+#     keytype = "SYMBOL",
+#     columns = "ENTREZID"
+# )$ENTREZID
+# go <- get_GOenrichment(meta_signature_entrez, universe_entrez)
+# selection <- go$Size >= 3 & go$Size <= 300 & go$Count >= 3 & go$OddsRatio > 2
+# go_filtered <- go[selection, ]
+# go_filtered <- go_filtered[order(go_filtered$OddsRatio, decreasing = TRUE), ]
+# go_filtered
+# 
+# go_desc <- arrange(go, OddsRatio)
+# go_gg <- go_filtered %>% 
+#   mutate(Term = factor(Term, go_desc$Term)) %>% 
+#   ggplot(aes(Term, OddsRatio)) +
+#     geom_segment(aes(x = Term, xend = Term, y = 0, yend = OddsRatio), color = "skyblue") +
+#     geom_point(color = "blue", size = 4, alpha = 0.8) +
+#     theme_light() +
+#     coord_flip() +
+#     xlab("") +
+#     ylab("Odds Ratio") +
+#     theme(
+#       panel.grid.major.y = element_blank(),
+#       panel.border = element_blank(),
+#       axis.ticks.y = element_blank()
+#     )
+# ggsave(
+#   plot = go_gg, 
+#   filename = str_c("results/plots/", date, "_",  "go_enrichment_metasignatures.pdf"),
+#   height = 7,
+#   width = 9
+# )
+# go_gg
+# saveRDS(go_gg, file = "results/R_objects/go_enrichment_gg.rds")
+
+
+# For each cell type separately
+meta_signature_entrez <- map(metasignatures, function(signature) {
+  meta_signature_entrez <- AnnotationDbi::select(
+    x = org.Hs.eg.db, 
+    keys = signature, 
+    keytype = "SYMBOL",
+    columns = "ENTREZID"
+  )$ENTREZID
+  meta_signature_entrez
+})
+universe_entrez <- AnnotationDbi::select(
+    x = org.Hs.eg.db,
+    keys = rownames(sce_10x),
+    keytype = "SYMBOL",
+    columns = "ENTREZID"
+)$ENTREZID
+go_cell_types <- map(
+  meta_signature_entrez, 
+  get_GOenrichment, 
+  universe = universe_entrez
+)
+go_cell_types <- map(go_cell_types, function(go) {
+  selection <- go$Size >= 3 & go$Size <= 300 & go$Count >= 3 & go$OddsRatio > 2 & go$Pvalue < 0.05
+  go <- go[selection, ]
+  go[order(go$OddsRatio, decreasing = TRUE), ]
+})
+
+selected_terms <- Reduce(intersect, map(go_cell_types, "Term"))
+odds <- map(go_cell_types, ~ .[.$Term %in% selected_terms, "OddsRatio"])
+odds_df <- odds %>% 
+  bind_cols() %>% 
+  mutate(term = selected_terms) %>% 
+  gather(key = "cell_type", value = "odds_ratio", - "term") %>% 
+  group_by(term) %>% 
+  summarise(mean_odds_ratio = mean(odds_ratio)) %>% 
+  arrange(desc(mean_odds_ratio))
+odds_gg <- odds_df[1:3, ] %>% 
+  mutate(term = factor(term, levels = rev(term))) %>% 
+  ggplot(aes(term, mean_odds_ratio)) +
+    geom_segment(aes(x = term, xend = term, y = 0, yend = mean_odds_ratio), 
+                 color = "skyblue") +
+    geom_point(color = "blue", size = 4, alpha = 0.8) +
+    theme_light() +
+    coord_flip() +
+    xlab("") +
+    ylab("Mean Odds Ratio") +
+    theme(
+      panel.grid.major.y = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+odds_gg
+saveRDS(object = odds_gg, "results/R_objects/go_enrichment_gg.rds")
+
+# Save GO results to excel
+file <- "results/tables/go_enrichment_PBMC.xlsx"
+openxlsx::write.xlsx(go_cell_types, file = file)
+```
+
+Strikingly, we see the following results:
+
+- In general, the immune functions of PBMCs seem to be altered.
+- Arpc2/3 complex is essential for T cell homeostasis, as described [here](https://www.nature.com/articles/s41598-017-08357-4). In general, it seems that the actin cytoskeleton lost its function.
+- "Response to cold" was one of the enriched terms, which is consistent with the change in temperature that PBMCs experience when they are extracted from blood, which is at ~37ºC, and place to room temperature (~20ºC).
+
+Thus, our signatures are biologically meaningful, which validates even more their reliability.
+
+
+Revigo:
+
+```{r}
+go_cell_types <- map(go_cell_types, ~ .[1:5, c("GOBPID", "OddsRatio")])
+go_cell_types <- bind_rows(go_cell_types, .id = "cell_type")
+write_tsv(
+  go_cell_types[, c("GOBPID", "OddsRatio")], 
+  path = "results/tables/input_revigo.tsv", 
+  col_names = FALSE
+)
+
+# Source R script resulting from ReviGO
+source("bin/revigo_GO_cell_types.r")
+index_cell_type <- match(one.data$term_ID, go_cell_types$GOBPID)
+one.data$cell_type <- go_cell_types$cell_type[index_cell_type]
+palette <- c("#c20a35", "#aa2edc", "chartreuse2", "#bbaa2a", "#71bdd0")
+specific_GO <- one.data %>% 
+  mutate(cell_type = factor(cell_type, cell_types)) %>%  
+  ggplot(aes(plot_X, plot_Y, label = description, size = plot_size, color = cell_type)) +
+    geom_text_repel() +
+    labs(x = "Semantic Space X", y = "Semantic Space Y", 
+         size = "Odds Ratio", color = "") +
+    scale_color_manual(values = palette) +
+    theme_classic() +
+    theme(panel.border = element_rect(fill = NA), legend.position = "bottom") 
+specific_GO
+```
+
+Gene Ontology figure:
+
+```{r}
+dot_plot_metasignatures <- readRDS("results/R_objects/dot_plot_metasignatures.rds")
+legend_dot_plot <- as_ggplot(get_legend(dot_plot_metasignatures))
+legend_word_cloud <- as_ggplot(get_legend(specific_GO))
+dot_plot_metasignatures <- dot_plot_metasignatures +
+  theme(legend.position = "none")
+specific_GO <- specific_GO +
+  theme(legend.position = "none")
+common_specific_column <- plot_grid(
+  odds_gg,
+  NULL,
+  specific_GO,
+  nrow = 3,
+  ncol = 1,
+  rel_heights = c(0.3, 0.025, 0.7)
+)
+go_figure <- plot_grid(
+  dot_plot_metasignatures,
+  NULL,
+  common_specific_column,
+  nrow = 1,
+  ncol = 3,
+  rel_widths = c(0.3, 0.025, 0.7)
+)
+
+ggsave(
+  filename = "doc/figures/legend_dot_plot.pdf", 
+  plot = legend_dot_plot, 
+  width = 5, 
+  height = 3
+)
+ggsave(
+  filename = "doc/figures/legend_word_cloud.pdf", 
+  plot = legend_word_cloud, 
+  width = 8, 
+  height = 1
+)
+ggsave(
+  filename = "doc/figures/go_figure.pdf", 
+  plot = go_figure, 
+  width = 13, 
+  height = 9
+)
+
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,486 @@
+---
+title: "Biological analysis"
+author: "Ramon Massoni-Badosa"
+date: "2019/04/08"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+
+# Introduction
+We already demultiplexed and assigned cells back to their original condition, filtered low-quality cells, normalized UMI counts and classified cells by cell types (CD4 T , Cytotoxic (CD8 T  + NK), monocytes and B cells). Thus, we dispose of a processed dataset to start answering the following questions:
+
+1. Does the time required to freeze a sample bias a cell's transcriptome (i.e. introduces technical artifacts)?
+2. If (1) is true, can we correct it by adjusting the experimental conditions (i.e. changing the temperature)?
+
+## Package loading
+
+```{r}
+library(Matrix)
+library(stringr)
+library(psych)
+library(kmed)
+library(pheatmap)
+library(fitdistrplus)
+library(ggpubr)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(SC3)
+library(Seurat)
+library(purrr)
+library(grid)
+library(gridExtra)
+library(gridGraphics)
+library(Seurat)
+library(cowplot)
+library(tidyverse)
+```
+
+## Source function definitions
+
+```{r}
+source(file = "bin/utils.R")
+```
+
+## Load SingleCellExperiment
+
+```{r}
+pbmc <- readRDS("results/R_objects/10X_SingleCellExperiment_clustered.RDS")
+```
+
+# Effect of time on gene expression
+First, we aim to elucidate whether the time that a blood sample spends at room temperature before cryopreservation introduces technical noise to the gene expression matrix. We dispose of data from two donors (male and female), which we will use as biological replicates. For each of them, the same blood sample was kept at room temperature for several times: 0h, 2h, 8h, 24h, 48h. Our hypothesis is that, if this variable introduces artifacts, cells will cluster by time. Thus, our first approach will be to perform non-linear dimensionality reduction (tSNE) to visualize such an effect.
+
+```{r}
+date <- Sys.Date()
+
+# Separate SCE into the two replicates: male and female
+pbmc_l <- list(male = pbmc[, pbmc$sex == "male"], female = pbmc[, pbmc$sex == "female"])
+
+# Filter out 4ºC cells, as we will focus on them later
+pbmc_l <- map(pbmc_l, ~ .[, .$temperature != "4ºC"])
+
+# Find hypervariable genes
+pbmc_l <- map(pbmc_l, function(x) {
+  fit_var <- trendVar(x, use.spikes = FALSE) 
+  decomp_var <- decomposeVar(x, fit_var)
+  top_hvgs <- order(decomp_var$bio, decreasing = TRUE)
+  top_20_pct_hvgs <- top_hvgs[1:(0.2 * length(top_hvgs))]
+  x[top_20_pct_hvgs, ]
+})
+  
+# Plot tSNE
+time_points <- c("0h", "2h", "8h", "24h", "48h")
+pbmc_l$female$time <- factor(pbmc_l$female$time, levels = time_points)
+pbmc_l$male$time <- factor(pbmc_l$male$time, levels = time_points)
+palette <- c("#999999", "#92e8df", "#632c63", "#e4624e", "#c0e212")
+set.seed(1)
+tsnes_sex <- map(c("male", "female"), function(sex) {
+  plot_tsne(
+    pbmc_l[[sex]], 
+    exprs_values = "logcounts", 
+    color_by = "time", 
+    colors = palette,
+    point_size = 0.5,
+    point_alpha = 1,
+    title = str_to_title(sex)
+  )
+})
+tsnes_sex <- map(tsnes_sex, ~ . + 
+  guides(colour = guide_legend(override.aes = list(size = 4))))
+tsnes1 <- ggarrange(
+  plotlist = tsnes_sex, 
+  nrow = 2, 
+  ncol = 1, 
+  common.legend = TRUE
+)
+
+# Save plot
+ggsave(
+  plot = tsnes1,
+  filename = str_c("results/plots/", date, "_tSNEs_male&female.pdf"),
+  device = "pdf",
+  width = 12,
+  height = 6.5
+)
+saveRDS(object = tsnes_sex[[2]], "results/R_objects/tsne_time_points_female_gg.rds")
+tsnes_sex
+```
+
+Indeed, we see how time until cryopreservation has an effect on gene-expression. Specifically, we see a clear gradient from 0h-2h to 48h. 
+
+Let us assess whether time is explained by any of the principal components (PCs) for each cell type:
+
+```{r}
+# Separate by cell types
+pbmc_fil <- pbmc[, pbmc$temperature != "4ºC"]
+pbmc_types <- list(
+  "CD4 T" = pbmc_fil[, pbmc_fil$cell_type == "CD4 T"],
+  "CD8 T" = pbmc_fil[, pbmc_fil$cell_type == "CD8 T"],
+  "NK" = pbmc_fil[, pbmc_fil$cell_type == "NK"],
+  "Monocyte" = pbmc_fil[, pbmc_fil$cell_type == "Monocyte"],
+  "B" = pbmc_fil[, pbmc_fil$cell_type == "B"]
+)
+
+# Run PCA
+pbmc_types <- pbmc_types %>% 
+  map(find_var_genes) %>% 
+  map(~ runPCA(., ntop = nrow(.)))
+
+# Plot PC1 vs time 
+pc1_time_df <- map(pbmc_types, function(sce) {
+  reducedDim(sce, "PCA") %>%
+    as.data.frame() %>%
+    set_names(c("PC1", "PC2")) %>%
+    dplyr::mutate(time = sce$time)
+})
+pc1_time_df <- bind_rows(pc1_time_df, .id = "cell_type")
+palette2 <- c("#c20a35", "#aa2edc", "green2", "#bbaa2a", "#71bdd0")
+pc1_time_gg <- pc1_time_df %>%
+  dplyr::mutate(time = factor(time, c("0h", "2h", "8h", "24h", "48h"))) %>%
+  dplyr::mutate(cell_type = factor(cell_type, c("CD4 T", "CD8 T", "NK", "Monocyte", "B"))) %>%
+  filter(PC1 > -10, PC1 < 10) %>% 
+  ggplot(aes(time, PC1, fill = cell_type)) +
+    geom_boxplot(outlier.shape = NA) +
+    scale_fill_manual(values = palette2) +
+    labs(x = "", fill = "") +
+    theme_classic()
+saveRDS(object = pc1_time_gg, file = "results/R_objects/pc1_time_gg.rds")
+pc1_time_gg
+ggsave(
+  plot = pc1_time_gg,
+  filename = str_c("results/plots/", date, "_pc1_vs_time.pdf"),
+  width = 9,
+  height = 7
+)
+
+# #version 2#####
+# pc1_time_gg2 <- pc1_time_df %>%
+#   dplyr::mutate(time = factor(time, c("0h", "2h", "8h", "24h", "48h"))) %>%
+#   dplyr::mutate(cell_type = factor(cell_type, c("CD4 T", "CD8 T", "NK", "Monocyte", "B"))) %>%
+#   filter(PC1 > -10, PC1 < 10) %>% 
+#   ggplot(aes(time, PC1)) +
+#     geom_boxplot(outlier.shape = NA, fill = "grey") +
+#     facet_grid(. ~ cell_type) +
+#     labs(x = "") +
+#     theme_bw()
+# pc1_time_gg2
+# ggsave(
+#   plot = pc1_time_gg2,
+#   filename = str_c("results/plots/", date, "_pc1_vs_time2.pdf"),
+#   width = 11,
+#   height = 5
+# )
+```
+
+Interestingly, for most PBMC types, processing time represents the major source of variability (as it explains the variability in PC1). This is not as obvious for B cells, likely because there are too few.
+
+## Zoom-in into each cell type
+We are also interested in whether the aforementioned effect is cell-type specific or whether is ubiquitously found in all cell types:
+
+```{r}
+# For each sex and cell_type, run tSNE to zoom-in into specific populations
+set.seed(2)
+cell_types <- levels(pbmc$cell_type)
+zoom_l <- map(c("male", "female"), function(x) {
+  tsne_df <- data.frame()
+  for (cell_type in cell_types) {
+    curr_pbmc <- pbmc_l[[x]][, pbmc_l[[x]]$cell_type == cell_type]
+    curr_pbmc <- find_var_genes(curr_pbmc)
+    curr_pbmc <- runTSNE(object = curr_pbmc, exprs_values = "logcounts")
+    curr_df <- reducedDim(curr_pbmc, "TSNE") %>%
+      as.data.frame() %>% 
+      set_names(c("TSNE1", "TSNE2")) %>% 
+      mutate(time = colData(curr_pbmc)[["time"]], 
+             cell_type = rep(cell_type, ncol(curr_pbmc))) 
+    tsne_df <- rbind(tsne_df, curr_df)
+  }
+  tsne_df
+})
+
+# Join male and female into same df
+# Relevel categorical variables for visualization
+zoom_df <- zoom_l %>% 
+  set_names(c("male", "female")) %>% 
+  bind_rows(.id = "sex") %>% 
+  mutate(sex = factor(sex, levels = c("male", "female")),
+         cell_type = factor(cell_type, levels = cell_types),
+         time = factor(time, levels = c("0h", "2h", "8h", "24h", "48h")))
+
+# Plot tSNE
+zoom_tsne <- zoom_df %>% 
+  ggplot(aes(TSNE1, TSNE2, color = time)) +
+    geom_point(size = 0.2, alpha = 1) +
+    scale_color_manual(values = palette) +
+    labs(color = "") +
+    facet_grid(sex ~ cell_type) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5),
+          panel.grid = element_blank(),
+          strip.text = element_text(size = 12),
+          legend.text = element_text(size = 12)) +
+    guides(colour = guide_legend(override.aes = list(size = 4)))
+
+# Save tSNE
+ggsave(
+  plot = zoom_tsne,
+  filename = str_c("results/plots/", date, "_tSNEs_zoom.pdf"),
+  device = "pdf",
+  height = 7.5,
+  width = 15
+)
+
+saveRDS(object = zoom_tsne, "results/R_objects/tsne_time_points_by_cell_types_gg.rds")
+zoom_tsne
+```
+
+We can clearly visualize that not only is the effect consistent across the major cell types, but also in subtypes that contain fewer cells.
+
+# Room temperature vs 4ºC
+Finally, we want to inspect if maintaining cells at 4ºC prevents the bias from appearing:
+
+```{r}
+# Separate SCE into the two replicates: male and female
+pbmc_temp <- list(
+  male = pbmc[, pbmc$sex == "male"], 
+  female = pbmc[, pbmc$sex == "female"]
+)
+
+# Filter out 2h
+pbmc_temp <- map(pbmc_temp, ~ .[, .$time != "2h"])
+
+# Find hypervariable genes
+pbmc_temp <- map(pbmc_temp, function(x) {
+  fit_var <- trendVar(x, use.spikes = FALSE) 
+  decomp_var <- decomposeVar(x, fit_var)
+  top_hvgs <- order(decomp_var$bio, decreasing = TRUE)
+  top_20_pct_hvgs <- top_hvgs[1:(0.2 * length(top_hvgs))]
+  x[top_20_pct_hvgs, ]
+})
+
+# Plot tSNE
+temps <- c("gold", "room temperature", "4ºC")
+pbmc_temp$female$temperature <- factor(pbmc_temp$female$temperature, temps)
+pbmc_temp$male$temperature <- factor(pbmc_temp$male$temperature, temps)
+
+tsnes_temp <- map(c("male", "female"), function(sex) {
+  plot_tsne(
+    pbmc_temp[[sex]], 
+    exprs_values = "logcounts", 
+    color_by = "temperature", 
+    colors = c("#999999", "#ed9121", "#a5cded"),
+    point_size = 0.5,
+    point_alpha = 0.9,
+    title = str_to_title(sex)
+  )
+})
+tsnes_temp <- map(tsnes_temp, ~ . + 
+  guides(colour = guide_legend(override.aes = list(size = 4))))
+tsnes_temp2 <- ggarrange(
+  plotlist = tsnes_temp, 
+  nrow = 1, 
+  ncol = 2, 
+  common.legend = TRUE
+)
+
+# Save plot
+ggsave(
+  plot = tsnes_temp2,
+  filename = str_c("results/plots/", date, "_tSNEs_tempearature.pdf"),
+  device = "pdf",
+  height = 7,
+  width = 12
+)
+saveRDS(tsnes_temp[[2]], file = "results/R_objects/tsne_temperature_female.rds")
+tsnes_temp
+```
+
+As we can see, cells that were kept at 4ºC before cryopreservation cluster with the "gold-standard" cells (i.e. those that were cryopreserved right after extraction). Hence, we can conclude that cells should be kept at the fridge before processing. Note however, that we have very few 4ºC cells for the male donor, so we cannot be absolutely certain that this is consistent across individuals. Moreover, although the 'mixedness' is much better, 4ºC cells still seem to mix preferably between them than with 0h cells.
+
+Let us assess whether there are any differentially expressed genes between 4ºC and 0h:
+
+```{r}
+# Filter pbmc to retain only 4ºC and 0h cells from the female donor
+pbmc_temp_f <- pbmc[, pbmc$sex == "female" & pbmc$temperature != "room temperature"]
+
+# Split by cell type
+pbmc_temp_l <-list(
+  "CD4 T" = pbmc_temp_f[, pbmc_temp_f$cell_type == "CD4 T"],
+  "CD8 T" = pbmc_temp_f[, pbmc_temp_f$cell_type == "CD8 T"],
+  "NK" = pbmc_temp_f[, pbmc_temp_f$cell_type == "NK"],
+  "Monocyte" = pbmc_temp_f[, pbmc_temp_f$cell_type == "Monocyte"],
+  "B" = pbmc_temp_f[, pbmc_temp_f$cell_type == "B"]
+)
+
+# Convert to Seurat objects
+pbmc_temp_l <- map(pbmc_temp_l, Convert, to = "seurat")
+pbmc_temp_l <- map(pbmc_temp_l, ScaleData)
+pbmc_temp_l <- map(pbmc_temp_l, SetAllIdent, id = "temperature")
+output_dea <- map(pbmc_temp_l, function(seurat) {
+  dea_output <- FindMarkers(
+    seurat, 
+    ident.1 = "4ºC", 
+    ident.2 = "gold", 
+    test.use = "MAST"
+  )
+})
+
+# Heatmap DEG
+output_dea_sig <- map(output_dea, function(df) {
+  df <- df %>% 
+    rownames_to_column(var = "gene") %>% 
+    filter(p_val_adj < 0.01 & avg_logFC > 1)
+  rownames(df) <- df$gene
+  df
+})
+all_sig_genes <- output_dea_sig %>% 
+  map("gene") %>% 
+  unlist() %>% 
+  unique()
+p_adj_list <- map(all_sig_genes, function(gene) {
+  p_adj_vec <- map_dbl(cell_types, ~ output_dea_sig[[.]][gene, "p_val_adj"] )
+  p_adj_vec[is.na(p_adj_vec)] <- 1
+  p_adj_vec
+})
+names(p_adj_list) <- all_sig_genes
+p_adj_mat <- p_adj_list %>% 
+  bind_rows() %>% 
+  t() %>% 
+  as.matrix()
+colnames(p_adj_mat) <- cell_types
+p_adj_mat <- -1 * log10(p_adj_mat)
+cols <- colorRampPalette(c("gray99", "brown2"))(30)
+p_adj_mat <- p_adj_mat[, c(1:3, 5, 4)]
+heat_4vs0 <- pheatmap(p_adj_mat, cluster_rows = FALSE, angle_col = 45, cluster_cols = FALSE, color = cols)
+
+# Save
+pdf(
+  file = str_c("results/plots/", date, "_heatmap_4ºC_vs_0h.pdf"), 
+  height = 6, 
+  width = 3
+)
+print(heat_4vs0)
+dev.off()
+pdf(
+  file = str_c("doc/figures/R/", date, "_heatmap_4ºC_vs_0h.pdf"), 
+  height = 6.9, 
+  width = 3.3
+)
+print(heat_4vs0)
+dev.off()
+```
+Although very few genes were differentially expressed, they are highly biologically meaningful. For instance, JUN, a gene essential for stress adaptation (as explained in [this paper](https://www.nature.com/articles/cdd201022)), was differentially expressed in all PBMC types. 
+
+# Final figure
+
+```{r}
+# Figure effect time at RT and 4ºC
+tsne_time <- tsnes_sex[[2]] +
+  ggtitle(NULL) +
+  theme(axis.line = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        axis.title = element_blank(), 
+        panel.border = element_blank(),
+        legend.position = "top")
+tsne_temp <- tsnes_temp[[2]] +
+  ggtitle(NULL) +
+  theme(axis.line = element_blank(), 
+        axis.ticks = element_blank(), 
+        axis.text = element_blank(), 
+        axis.title = element_blank(), 
+        panel.border = element_blank(),
+        legend.position = "top") +
+  guides(colour = guide_legend(override.aes = list(size = 4)))
+tsne_zoom <- zoom_df %>% 
+  filter(sex == "female") %>% 
+  ggplot(aes(TSNE1, TSNE2, color = time)) +
+  geom_point(size = 2, alpha = 1) +
+  scale_color_manual(values = palette) +
+  labs(color = "") +
+  facet_grid(. ~ cell_type) +
+  theme_bw() +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12),
+        legend.position = "none") +
+  guides(colour = guide_legend(override.aes = list(size = 4)))
+
+tsne_time_temp <- ggarrange(plotlist = list(tsne_time, tsne_temp), ncol = 2, nrow = 1)
+effect_time_figure <- plot_grid(
+  tsne_time_temp, 
+  NULL,
+  tsne_zoom, 
+  nrow = 3,
+  ncol = 1, 
+  rel_heights = c(1.2, 0.1, 0.8)
+)
+ggsave(
+  filename = str_c("results/plots/", date, "_effect_time_figure.pdf"), 
+  plot = effect_time_figure, 
+  width = 12, 
+  height = 12
+)
+effect_time_figure
+```
+
+## Supplementary figure
+
+```{r}
+leg <- as_ggplot(get_legend(tsnes_sex[[1]]))
+tsne_male <- tsnes_sex[[1]] +
+  theme(plot.title = element_blank(),
+        legend.position  = "none",
+        plot.background = element_blank(),
+        panel.border = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank())
+zoom_tsne <- zoom_tsne +
+  theme_classic() +
+  theme(legend.position = "none", 
+        axis.text = element_text(size = 7),
+        axis.title = element_text(size = 10)) +
+  labs(x = "tSNE1", y = "tSNE2") 
+reproducible_donors_gg <- plot_grid(
+  tsne_male, 
+  NULL, 
+  zoom_tsne, 
+  nrow = 1, 
+  ncol = 3, 
+  rel_widths = c(0.35, 0.02, 0.75),
+  labels = c("a", "", "b")
+)
+ggsave(
+  filename = str_c("doc/figures/legends/", date, "_legend_tsne_time.pdf"),
+  plot = leg, 
+  width = 1, 
+  height = 3
+)
+ggsave(
+  filename = str_c("doc/figures/R/", date, "_reproducible_donors.pdf"), 
+  plot = reproducible_donors_gg, 
+  width = 18.5, 
+  height = 7,
+  units = "cm"
+)
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
+
