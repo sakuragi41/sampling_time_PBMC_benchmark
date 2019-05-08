@@ -1,0 +1,13 @@
+# README
+
+This repo contains all the Rmd notebooks with all the code to reproduce "Single-cell sequencing reveals processing time sensitive expression profiles of blood cell types". In the following lines we provide a brief description of each notebook, together with a link to access its compiled html version on-line:
+
+* [01-demultiplex.Rmd](https://htmlpreview.github.io/?https://github.com/massonix/sampling_time_PBMC_benchmark/blob/master/01-demultiplex.html) contains the code to demultiplex the hasthags oligonucleotides (HTO) to assign each cell to each original experimental condition.
+* [02-qc-normalization.Rmd](https://htmlpreview.github.io/?https://github.com/massonix/sampling_time_PBMC_benchmark/blob/master/02-qc-normalization.html) contains the code for the cell and gene filtering based on quality control metrics, together with the unique molecular identifiers (UMI) normalization and batch effect detection.
+* [03-clustering.Rmd](https://htmlpreview.github.io/?https://github.com/massonix/sampling_time_PBMC_benchmark/blob/master/03-clustering.html) contains the code clustering and cell type annotation of the Peripheral Blood Mononuclear Cells (PBMCs).
+* [04-biological_analysis.Rmd](https://htmlpreview.github.io/?https://github.com/massonix/sampling_time_PBMC_benchmark/blob/master/04-biological_analysis.html) contains the code to produce the t-SNEs that highlight how processing time until cryopreservation distorts single-cell transcriptional profiles.
+* [05-find_gene_signature.Rmd](https://htmlpreview.github.io/?https://github.com/massonix/sampling_time_PBMC_benchmark/blob/master/05-find_gene_signature.html) contains the code to find the PBMC-specific gene signatures induced by time at room temperature.
+* [06-validate_gene_signature.Rmd](https://htmlpreview.github.io/?https://github.com/massonix/sampling_time_PBMC_benchmark/blob/master/06-validate_gene_signature.html) contains the code to validate the aforementioned gene signatures from 3 perspectives: discriminative power, time-dependency and biological significance.
+* [07-remove_gene_signature.Rmd](https://htmlpreview.github.io/?https://github.com/massonix/sampling_time_PBMC_benchmark/blob/master/07-remove_gene_signature.html) contains the code to computationally correct the transcriptional profiles affected by time.
+* [08-gene_signature_Smartseq.Rmd](https://github.com/massonix/sampling_time_PBMC_benchmark/blob/master/08-gene_signature_Smartseq.html) contains the analysis of the Smart-seq2 dataset, which reproduces all the findings found in the previous notebooks with 10X data.
+* [utils.R](https://github.com/massonix/sampling_time_PBMC_benchmark/blob/master/bin/utils.R) contains a collection of functions used throughout all the notebooks.
